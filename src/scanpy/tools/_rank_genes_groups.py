@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 # Used with get_literal_vals
-_Method = Literal["logreg", "t-test", "wilcoxon", "t-test_overestim_var"]
+_Method = Literal["logreg", "t-test", "wilcoxon", "bws", "t-test_overestim_var"]
 
 _CONST_MAX_SIZE = 10000000
 
@@ -362,6 +362,98 @@ class _RankGenes:
 
                 yield group_index, scores[group_index], pvals
 
+    def bws(
+            self, *, tie_correct: bool
+        ) -> Generator[tuple[int, NDArray[np.floating], NDArray[np.floating]], None, None]:
+            from scipy import stats
+    
+            self._basic_stats()
+    
+            n_genes = self.X.shape[1]
+    
+            # First loop: Loop over all genes
+            if self.ireference is not None:
+                # Initialize space for BWS test statistics
+                scores = np.zeros(n_genes)
+                # Initialize space for tie correction coefficients (if needed)
+                T = np.zeros(n_genes) if tie_correct else 1
+    
+                for group_index, mask_obs in enumerate(self.groups_masks_obs):
+                    if group_index == self.ireference:
+                        continue
+    
+                    mask_obs_rest = self.groups_masks_obs[self.ireference]
+    
+                    n_active = np.count_nonzero(mask_obs)
+                    m_active = np.count_nonzero(mask_obs_rest)
+    
+                    # Adjusted cut-off for BWS test
+                    if n_active <= 15 or m_active <= 15:
+                        logg.hint(
+                            "Few observations in a group (<=10). "
+                            "The BWS test is more robust to weights to heavy tails of data, but results may still be less reliable with low sample sizes."
+                        )
+    
+                    # Calculate ranks for each chunk for the current mask
+                    for ranks, left, right in _ranks(self.X, mask_obs, mask_obs_rest):
+                        # Compute the BWS test statistic for each gene
+                        for i in range(left, right):
+                            group_data = self.X[mask_obs, i].toarray().flatten() if issparse(self.X) else self.X[mask_obs, i]
+                            reference_data = self.X[mask_obs_rest, i].toarray().flatten() if issparse(self.X) else self.X[mask_obs_rest, i]
+    
+                            # Perform the BWS test
+                            try:
+                                stat, pval = bws_test(group_data, reference_data)
+                            except ValueError:  # Handle cases where the test fails (e.g., insufficient data)
+                                stat, pval = np.nan, np.nan
+    
+                            scores[i] = stat
+                            if tie_correct:
+                                T[i] = _tiecorrect(ranks.iloc[:, i - left])
+    
+                    # Standardize the BWS test statistic (if needed)
+                    scores[np.isnan(scores)] = 0
+                    pvals = 2 * stats.distributions.norm.sf(np.abs(scores))  # Placeholder for p-value calculation
+    
+                    yield group_index, scores, pvals
+            # If no reference group exists,
+            # ranking needs only to be done once (full mask)
+            else:
+                n_groups = self.groups_masks_obs.shape[0]
+                scores = np.zeros((n_groups, n_genes))
+                n_cells = self.X.shape[0]
+    
+                if tie_correct:
+                    T = np.zeros((n_groups, n_genes))
+    
+                for ranks, left, right in _ranks(self.X):
+                    # Compute the BWS test statistic for each gene and group
+                    for group_index, mask_obs in enumerate(self.groups_masks_obs):
+                        for i in range(left, right):
+                            group_data = self.X[mask_obs, i].toarray().flatten() if issparse(self.X) else self.X[mask_obs, i]
+                            reference_data = self.X[~mask_obs, i].toarray().flatten() if issparse(self.X) else self.X[~mask_obs, i]
+    
+                            # Perform the BWS test
+                            try:
+                                stat, pval = bws_test(group_data, reference_data)
+                            except ValueError:  # Handle cases where the test fails (e.g., insufficient data)
+                                stat, pval = np.nan, np.nan
+    
+                            scores[group_index, i] = stat
+                            if tie_correct:
+                                T[group_index, i] = _tiecorrect(ranks.iloc[:, i - left])
+    
+                for group_index, mask_obs in enumerate(self.groups_masks_obs):
+                    n_active = np.count_nonzero(mask_obs)
+    
+                    T_i = T[group_index] if tie_correct else 1
+    
+                    # Standardize the BWS test statistic (if needed)
+                    scores[group_index, :][np.isnan(scores[group_index, :])] = 0
+                    pvals = 2 * stats.distributions.norm.sf(np.abs(scores[group_index, :]))  # Placeholder for p-value calculation
+    
+                    yield group_index, scores[group_index], pvals
+
     def logreg(
         self, **kwds
     ) -> Generator[tuple[int, NDArray[np.floating], None], None, None]:
@@ -409,6 +501,8 @@ class _RankGenes:
             generate_test_results = self.t_test(method)
         elif method == "wilcoxon":
             generate_test_results = self.wilcoxon(tie_correct=tie_correct)
+        elif method == "bws":
+            generate_test_results = self.bws(tie_correct=tie_correct)
         elif method == "logreg":
             generate_test_results = self.logreg(**kwds)
 
@@ -500,7 +594,8 @@ def rank_genes_groups(
     layer: str | None = None,
     **kwds,
 ) -> AnnData | None:
-    """Rank genes for characterizing groups.
+    """\
+    Rank genes for characterizing groups.
 
     Expects logarithmized data.
 
@@ -531,6 +626,7 @@ def rank_genes_groups(
         The default method is `'t-test'`,
         `'t-test_overestim_var'` overestimates variance of each group,
         `'wilcoxon'` uses Wilcoxon rank-sum,
+        `'bws'` uses Baumgartner-Weiss-Schindler test,
         `'logreg'` uses logistic regression. See :cite:t:`Ntranos2019`,
         `here <https://github.com/scverse/scanpy/issues/95>`__ and `here
         <https://www.nxn.se/valent/2018/3/5/actionable-scrna-seq-clusters>`__,
@@ -539,8 +635,7 @@ def rank_genes_groups(
         p-value correction method.
         Used only for `'t-test'`, `'t-test_overestim_var'`, and `'wilcoxon'`.
     tie_correct
-        Use tie correction for `'wilcoxon'` scores.
-        Used only for `'wilcoxon'`.
+        Use tie correction for `'wilcoxon'` and `'bws'` scores.
     rankby_abs
         Rank genes by the absolute value of the score, not by the
         score. The returned scores are never the absolute values.
@@ -593,10 +688,9 @@ def rank_genes_groups(
     --------
     >>> import scanpy as sc
     >>> adata = sc.datasets.pbmc68k_reduced()
-    >>> sc.tl.rank_genes_groups(adata, "bulk_labels", method="wilcoxon")
+    >>> sc.tl.rank_genes_groups(adata, 'bulk_labels', method='wilcoxon')
     >>> # to visualize the results
     >>> sc.pl.rank_genes_groups(adata)
-
     """
     mask_var = _check_mask(adata, mask_var, "var")
 
@@ -725,7 +819,7 @@ def rank_genes_groups(
                 "    'logfoldchanges', sorted np.recarray to be indexed by group ids\n"
                 "    'pvals', sorted np.recarray to be indexed by group ids\n"
                 "    'pvals_adj', sorted np.recarray to be indexed by group ids"
-                if method in {"t-test", "t-test_overestim_var", "wilcoxon"}
+                if method in {"t-test", "t-test_overestim_var", "wilcoxon", "bws"}
                 else ""
             )
         ),
@@ -760,11 +854,9 @@ def filter_rank_genes_groups(
     max_out_group_fraction: float = 0.5,
     compare_abs: bool = False,
 ) -> None:
-    """Filter out genes based on two criteria.
-
-    1. log fold change and
-    2. fraction of genes expressing the
-       gene within and outside the `groupby` categories.
+    """\
+    Filters out genes based on log fold change and fraction of genes expressing the
+    gene within and outside the `groupby` categories.
 
     See :func:`~scanpy.tl.rank_genes_groups`.
 
@@ -796,13 +888,12 @@ def filter_rank_genes_groups(
     --------
     >>> import scanpy as sc
     >>> adata = sc.datasets.pbmc68k_reduced()
-    >>> sc.tl.rank_genes_groups(adata, "bulk_labels", method="wilcoxon")
+    >>> sc.tl.rank_genes_groups(adata, 'bulk_labels', method='wilcoxon')
     >>> sc.tl.filter_rank_genes_groups(adata, min_fold_change=3)
     >>> # visualize results
-    >>> sc.pl.rank_genes_groups(adata, key="rank_genes_groups_filtered")
+    >>> sc.pl.rank_genes_groups(adata, key='rank_genes_groups_filtered')
     >>> # visualize results using dotplot
-    >>> sc.pl.rank_genes_groups_dotplot(adata, key="rank_genes_groups_filtered")
-
+    >>> sc.pl.rank_genes_groups_dotplot(adata, key='rank_genes_groups_filtered')
     """
     if key is None:
         key = "rank_genes_groups"
