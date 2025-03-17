@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import pandas as pd
 from scipy.sparse import issparse, vstack
+from scipy.stats import bws_test 
 
 from .. import _utils
 from .. import logging as logg
