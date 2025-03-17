@@ -376,6 +376,7 @@ class _RankGenes:
             if self.ireference is not None:
                 # Initialize space for BWS test statistics
                 scores = np.zeros(n_genes)
+                pvals = np.zeros(n_genes)
                 # Initialize space for tie correction coefficients (if needed)
                 T = np.zeros(n_genes) if tie_correct else 1
     
@@ -404,24 +405,28 @@ class _RankGenes:
     
                             # Perform the BWS test
                             try:
-                                stat, pval = bws_test(group_data, reference_data)
+                                result = bws_test(group_data, reference_data)
+                                stat = result.statistic
+                                pval = result.pvalue
                             except ValueError:  # Handle cases where the test fails (e.g., insufficient data)
                                 stat, pval = np.nan, np.nan
     
                             scores[i] = stat
+                            pvals[i] = pval
                             if tie_correct:
                                 T[i] = _tiecorrect(ranks.iloc[:, i - left])
     
-                    # Standardize the BWS test statistic (if needed)
+                    # Add in some code to catch if the test has NaN values
                     scores[np.isnan(scores)] = 0
-                    pvals = 2 * stats.distributions.norm.sf(np.abs(scores))  # Placeholder for p-value calculation
-    
+                    pvals[np.isnan(pvals)] = 1
+                        
                     yield group_index, scores, pvals
             # If no reference group exists,
             # ranking needs only to be done once (full mask)
             else:
                 n_groups = self.groups_masks_obs.shape[0]
                 scores = np.zeros((n_groups, n_genes))
+                pvals = np.zeros((n_groups, n_genes)) 
                 n_cells = self.X.shape[0]
     
                 if tie_correct:
@@ -436,11 +441,14 @@ class _RankGenes:
     
                             # Perform the BWS test
                             try:
-                                stat, pval = bws_test(group_data, reference_data)
+                                result = bws_test(group_data, reference_data)
+                                stat = result.statistic
+                                pval = result.pvalue
                             except ValueError:  # Handle cases where the test fails (e.g., insufficient data)
                                 stat, pval = np.nan, np.nan
     
                             scores[group_index, i] = stat
+                            pval[group_index, i] = pval
                             if tie_correct:
                                 T[group_index, i] = _tiecorrect(ranks.iloc[:, i - left])
     
@@ -449,10 +457,10 @@ class _RankGenes:
     
                     T_i = T[group_index] if tie_correct else 1
     
-                    # Standardize the BWS test statistic (if needed)
+                    # Add in some code to catch if the test has NaN values
                     scores[group_index, :][np.isnan(scores[group_index, :])] = 0
-                    pvals = 2 * stats.distributions.norm.sf(np.abs(scores[group_index, :]))  # Placeholder for p-value calculation
-    
+                    pvals[group_index, :][np.isnan(pvals[group_index, :])] = 1
+                    
                     yield group_index, scores[group_index], pvals
 
     def logreg(
